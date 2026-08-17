@@ -17,11 +17,12 @@ const phaseNotes: Record<string, string> = {
   "LLM 与 Agent": "把模型、工具与行动连接起来",
 };
 
-type ViewKey = "today" | "plan" | "progress";
+type ViewKey = "today" | "plan" | "notes" | "progress";
 
 const views: Array<{ id: ViewKey; label: string; hint: string }> = [
   { id: "today", label: "今天", hint: "现在做什么" },
   { id: "plan", label: "计划", hint: "按周查看" },
+  { id: "notes", label: "笔记", hint: "集中回顾" },
   { id: "progress", label: "进度", hint: "84 天轨迹" },
 ];
 
@@ -72,6 +73,7 @@ export default function Home() {
   const [focusMinutes, setFocusMinutes] = useState<Record<number, number>>({});
   const [timerSeconds, setTimerSeconds] = useState(FOCUS_SECONDS);
   const [timerRunning, setTimerRunning] = useState(false);
+  const [noteQuery, setNoteQuery] = useState("");
 
   useEffect(() => {
     try {
@@ -156,6 +158,20 @@ export default function Home() {
     totalFocusMinutes > 0 ||
     Object.values(notes).some((note) => note.trim().length > 0);
   const timerLabel = `${String(Math.floor(timerSeconds / 60)).padStart(2, "0")}:${String(timerSeconds % 60).padStart(2, "0")}`;
+  const notedDays = useMemo(() => {
+    const query = noteQuery.trim().toLocaleLowerCase("zh-CN");
+    return studyDays.filter((item) => {
+      const note = notes[item.day]?.trim();
+      if (!note) return false;
+      if (!query) return true;
+      return [note, item.course, item.phase, item.task, item.date]
+        .join(" ")
+        .toLocaleLowerCase("zh-CN")
+        .includes(query);
+    });
+  }, [noteQuery, notes]);
+  const noteCount = Object.values(notes).filter((note) => note.trim().length > 0).length;
+  const noteCharacters = Object.values(notes).reduce((sum, note) => sum + note.trim().length, 0);
 
   const weeks = useMemo(
     () =>
@@ -536,6 +552,73 @@ export default function Home() {
               );
             })}
           </div>
+        </section>
+      )}
+
+      {activeView === "notes" && (
+        <section
+          className="view-panel notes-view"
+          id="panel-notes"
+          role="tabpanel"
+          aria-labelledby="tab-notes"
+        >
+          <div className="view-intro compact">
+            <div>
+              <p className="overline">LEARNING NOTES</p>
+              <h1>把每天的理解串起来。</h1>
+            </div>
+            <p>这里汇总所有逐日笔记；输入课程、阶段或关键词即可搜索。</p>
+          </div>
+
+          <div className="notes-toolbar">
+            <div className="notes-stats">
+              <span><b>{noteCount}</b><em>篇笔记</em></span>
+              <span><b>{noteCharacters}</b><em>累计字数</em></span>
+            </div>
+            <label className="notes-search" htmlFor="notes-search-input">
+              <span>搜索笔记</span>
+              <input
+                id="notes-search-input"
+                type="search"
+                value={noteQuery}
+                onChange={(event) => setNoteQuery(event.target.value)}
+                placeholder="例如：递归、Python、Day 12"
+              />
+            </label>
+          </div>
+
+          {notedDays.length > 0 ? (
+            <div className="notes-list">
+              {notedDays.map((item) => (
+                <article className="note-entry" key={item.day}>
+                  <div className="note-entry-index">
+                    <span>DAY</span>
+                    <strong>{String(item.day).padStart(2, "0")}</strong>
+                    <time>{item.date}</time>
+                  </div>
+                  <div className="note-entry-content">
+                    <span className={`phase-badge ${phaseClass(item.phase)}`}>{item.phase}</span>
+                    <h2>{item.course}</h2>
+                    <p>{notes[item.day]}</p>
+                    <div>
+                      <a href={item.url} target="_blank" rel="noreferrer">打开课程 <ArrowIcon /></a>
+                      <button onClick={() => showDay(item.day)}>查看对应计划 →</button>
+                    </div>
+                  </div>
+                  {(focusMinutes[item.day] ?? 0) > 0 && (
+                    <span className="note-focus-time">专注 {focusMinutes[item.day]} 分钟</span>
+                  )}
+                </article>
+              ))}
+            </div>
+          ) : (
+            <div className="notes-empty">
+              <span aria-hidden="true">“ ”</span>
+              <h2>{noteCount === 0 ? "还没有学习笔记" : "没有匹配的笔记"}</h2>
+              <p>{noteCount === 0 ? "在“今天”或“计划”里记录一句关键理解，内容会自动出现在这里。" : "换一个更短的关键词试试。"}</p>
+              {noteCount === 0 && <button onClick={() => changeView("today")}>去记录今天的笔记</button>}
+            </div>
+          )}
         </section>
       )}
 
