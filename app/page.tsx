@@ -2,12 +2,23 @@
 
 /* eslint-disable react-hooks/set-state-in-effect -- localStorage is restored after hydration. */
 
-import { useEffect, useMemo, useState, type ChangeEvent } from "react";
+import type { User } from "@supabase/supabase-js";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ChangeEvent,
+  type FormEvent,
+} from "react";
+import { supabase, type StudyDayRow } from "./cloudSync";
 import { studyDays } from "./studyData";
 
 const STORAGE_KEY = "cs-ai-study-checkin-v1";
 const DETAILS_STORAGE_KEY = "cs-ai-study-details-v1";
 const FOCUS_SECONDS = 25 * 60;
+
+type SyncStatus = "local" | "syncing" | "synced" | "offline" | "error";
 
 const phaseNotes: Record<string, string> = {
   "Python 基础": "先把代码写起来",
@@ -64,6 +75,26 @@ function cleanMinutes(value: unknown): Record<number, number> {
   );
 }
 
+function cleanModifiedAt(value: unknown): Record<number, string> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return Object.fromEntries(
+    Object.entries(value).filter(([day, timestamp]) => {
+      const dayNumber = Number(day);
+      return (
+        dayNumber >= 1 &&
+        dayNumber <= studyDays.length &&
+        typeof timestamp === "string" &&
+        !Number.isNaN(Date.parse(timestamp))
+      );
+    }),
+  );
+}
+
+function formatSyncTime(timestamp: Date | null) {
+  if (!timestamp) return "等待首次同步";
+  return `${String(timestamp.getHours()).padStart(2, "0")}:${String(timestamp.getMinutes()).padStart(2, "0")} 已同步`;
+}
+
 export default function Home() {
   const [completed, setCompleted] = useState<Set<number>>(new Set());
   const [ready, setReady] = useState(false);
@@ -71,17 +102,30 @@ export default function Home() {
   const [selectedWeek, setSelectedWeek] = useState(1);
   const [notes, setNotes] = useState<Record<number, string>>({});
   const [focusMinutes, setFocusMinutes] = useState<Record<number, number>>({});
+  const [modifiedAt, setModifiedAt] = useState<Record<number, string>>({});
   const [timerSeconds, setTimerSeconds] = useState(FOCUS_SECONDS);
   const [timerRunning, setTimerRunning] = useState(false);
   const [noteQuery, setNoteQuery] = useState("");
+  const [user, setUser] = useState<User | null>(null);
+  const [syncStatus, setSyncStatus] = useState<SyncStatus>("local");
+  const [syncInitialized, setSyncInitialized] = useState(false);
+  const [syncPanelOpen, setSyncPanelOpen] = useState(false);
+  const [authEmail, setAuthEmail] = useState("");
+  const [authMessage, setAuthMessage] = useState("");
+  const [authPending, setAuthPending] = useState(false);
+  const [lastSyncAt, setLastSyncAt] = useState<Date | null>(null);
+  const [syncRetry, setSyncRetry] = useState(0);
+  const lastSyncedRef = useRef<Record<number, string>>({});
+  const stateRef = useRef({ completed, notes, focusMinutes, modifiedAt });
 
   useEffect(() => {
     try {
       const saved = window.localStorage.getItem(STORAGE_KEY);
+      let savedDays = new Set<number>();
       if (saved) {
         const parsed = JSON.parse(saved);
         if (Array.isArray(parsed)) {
-          const savedDays = new Set<number>(
+          savedDays = new Set<number>(
             parsed.filter(
               (day): day is number =>
                 Number.isInteger(day) && day >= 1 && day <= studyDays.length,
@@ -94,13 +138,30 @@ export default function Home() {
       }
 
       const savedDetails = window.localStorage.getItem(DETAILS_STORAGE_KEY);
+      let savedNotes: Record<number, string> = {};
+      let savedMinutes: Record<number, number> = {};
+      let savedModifiedAt: Record<number, string> = {};
       if (savedDetails) {
         const parsedDetails = JSON.parse(savedDetails);
         if (parsedDetails && typeof parsedDetails === "object") {
-          setNotes(cleanNotes(parsedDetails.notes));
-          setFocusMinutes(cleanMinutes(parsedDetails.focusMinutes));
+          savedNotes = cleanNotes(parsedDetails.notes);
+          savedMinutes = cleanMinutes(parsedDetails.focusMinutes);
+          savedModifiedAt = cleanModifiedAt(parsedDetails.modifiedAt);
         }
       }
+
+      const migrationTime = new Date().toISOString();
+      for (const item of studyDays) {
+        if (
+          !savedModifiedAt[item.day] &&
+          (savedDays.has(item.day) || savedNotes[item.day] || (savedMinutes[item.day] ?? 0) > 0)
+        ) {
+          savedModifiedAt[item.day] = migrationTime;
+        }
+      }
+      setNotes(savedNotes);
+      setFocusMinutes(savedMinutes);
+      setModifiedAt(savedModifiedAt);
     } catch {
       // A private browser session can block storage; check-ins still work in-session.
     } finally {
@@ -125,12 +186,263 @@ export default function Home() {
     try {
       window.localStorage.setItem(
         DETAILS_STORAGE_KEY,
-        JSON.stringify({ notes, focusMinutes }),
+        JSON.stringify({ notes, focusMinutes, modifiedAt }),
       );
     } catch {
       // Keep notes and timer usable in-session when storage is unavailable.
     }
-  }, [focusMinutes, notes, ready]);
+  }, [focusMinutes, modifiedAt, notes, ready]);
+
+  useEffect(() => {
+    stateRef.current = { completed, notes, focusMinutes, modifiedAt };
+  }, [completed, focusMinutes, modifiedAt, notes]);
+
+  useEffect(() => {
+    let active = true;
+
+    void supabase.auth.getSession().then(({ data }) => {
+      if (active) setUser(data.session?.user ?? null);
+    });
+
+    const { data } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (!active) return;
+      setUser(session?.user ?? null);
+      setAuthMessage("");
+      if (!session) {
+        setSyncInitialized(false);
+        setSyncStatus("local");
+        setLastSyncAt(null);
+        lastSyncedRef.current = {};
+      }
+    });
+
+    return () => {
+      active = false;
+      data.subscription.unsubscribe();
+    };
+  }, []);
+
+  useEffect(() => {
+    const handleOnline = () => setSyncRetry((current) => current + 1);
+    const handleOffline = () => user && setSyncStatus("offline");
+    window.addEventListener("online", handleOnline);
+    window.addEventListener("offline", handleOffline);
+    return () => {
+      window.removeEventListener("online", handleOnline);
+      window.removeEventListener("offline", handleOffline);
+    };
+  }, [user]);
+
+  useEffect(() => {
+    if (!ready || !user) return;
+    let cancelled = false;
+
+    async function initializeCloudSync() {
+      setSyncInitialized(false);
+      setSyncStatus(navigator.onLine ? "syncing" : "offline");
+      if (!navigator.onLine) return;
+
+      const { data, error } = await supabase
+        .from("study_day_states")
+        .select("user_id, day_number, completed, note, focus_minutes, updated_at")
+        .eq("user_id", user!.id);
+
+      if (cancelled) return;
+      if (error) {
+        setSyncStatus("error");
+        return;
+      }
+
+      const snapshot = stateRef.current;
+      const nextCompleted = new Set(snapshot.completed);
+      const nextNotes = { ...snapshot.notes };
+      const nextFocusMinutes = { ...snapshot.focusMinutes };
+      const nextModifiedAt = { ...snapshot.modifiedAt };
+      const cloudRows = new Map(
+        ((data ?? []) as StudyDayRow[]).map((row) => [row.day_number, row]),
+      );
+      const rowsToUpload: StudyDayRow[] = [];
+
+      for (const item of studyDays) {
+        const day = item.day;
+        const cloud = cloudRows.get(day);
+        const localTimestamp = nextModifiedAt[day];
+        const hasLocalDay =
+          nextCompleted.has(day) ||
+          Boolean(nextNotes[day]) ||
+          (nextFocusMinutes[day] ?? 0) > 0;
+
+        if (!cloud) {
+          if (localTimestamp || hasLocalDay) {
+            const timestamp = localTimestamp ?? new Date().toISOString();
+            nextModifiedAt[day] = timestamp;
+            rowsToUpload.push({
+              user_id: user!.id,
+              day_number: day,
+              completed: nextCompleted.has(day),
+              note: nextNotes[day] ?? "",
+              focus_minutes: nextFocusMinutes[day] ?? 0,
+              updated_at: timestamp,
+            });
+          }
+          continue;
+        }
+
+        if (localTimestamp && Date.parse(localTimestamp) > Date.parse(cloud.updated_at)) {
+          rowsToUpload.push({
+            user_id: user!.id,
+            day_number: day,
+            completed: nextCompleted.has(day),
+            note: nextNotes[day] ?? "",
+            focus_minutes: nextFocusMinutes[day] ?? 0,
+            updated_at: localTimestamp,
+          });
+          continue;
+        }
+
+        if (cloud.completed) nextCompleted.add(day);
+        else nextCompleted.delete(day);
+        if (cloud.note) nextNotes[day] = cloud.note;
+        else delete nextNotes[day];
+        if (cloud.focus_minutes > 0) nextFocusMinutes[day] = cloud.focus_minutes;
+        else delete nextFocusMinutes[day];
+        nextModifiedAt[day] = cloud.updated_at;
+        lastSyncedRef.current[day] = cloud.updated_at;
+      }
+
+      stateRef.current = {
+        completed: nextCompleted,
+        notes: nextNotes,
+        focusMinutes: nextFocusMinutes,
+        modifiedAt: nextModifiedAt,
+      };
+      setCompleted(nextCompleted);
+      setNotes(nextNotes);
+      setFocusMinutes(nextFocusMinutes);
+      setModifiedAt(nextModifiedAt);
+
+      if (rowsToUpload.length > 0) {
+        const { error: uploadError } = await supabase
+          .from("study_day_states")
+          .upsert(rowsToUpload, { onConflict: "user_id,day_number" });
+        if (cancelled) return;
+        if (uploadError) {
+          setSyncStatus("error");
+          return;
+        }
+        for (const row of rowsToUpload) {
+          lastSyncedRef.current[row.day_number] = row.updated_at;
+        }
+      }
+
+      setSyncInitialized(true);
+      setSyncStatus("synced");
+      setLastSyncAt(new Date());
+    }
+
+    void initializeCloudSync();
+    return () => {
+      cancelled = true;
+    };
+  }, [ready, syncRetry, user]);
+
+  useEffect(() => {
+    if (!ready || !user) return;
+
+    const channel = supabase
+      .channel(`study-sync-${user.id}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "study_day_states",
+          filter: `user_id=eq.${user.id}`,
+        },
+        (payload) => {
+          const row = payload.new as StudyDayRow;
+          if (!row?.day_number || row.day_number < 1 || row.day_number > studyDays.length) return;
+
+          const localTimestamp = stateRef.current.modifiedAt[row.day_number];
+          if (localTimestamp && Date.parse(localTimestamp) > Date.parse(row.updated_at)) return;
+
+          const nextCompleted = new Set(stateRef.current.completed);
+          const nextNotes = { ...stateRef.current.notes };
+          const nextFocusMinutes = { ...stateRef.current.focusMinutes };
+          const nextModifiedAt = { ...stateRef.current.modifiedAt, [row.day_number]: row.updated_at };
+
+          if (row.completed) nextCompleted.add(row.day_number);
+          else nextCompleted.delete(row.day_number);
+          if (row.note) nextNotes[row.day_number] = row.note;
+          else delete nextNotes[row.day_number];
+          if (row.focus_minutes > 0) nextFocusMinutes[row.day_number] = row.focus_minutes;
+          else delete nextFocusMinutes[row.day_number];
+
+          stateRef.current = {
+            completed: nextCompleted,
+            notes: nextNotes,
+            focusMinutes: nextFocusMinutes,
+            modifiedAt: nextModifiedAt,
+          };
+          lastSyncedRef.current[row.day_number] = row.updated_at;
+          setCompleted(nextCompleted);
+          setNotes(nextNotes);
+          setFocusMinutes(nextFocusMinutes);
+          setModifiedAt(nextModifiedAt);
+          setSyncStatus("synced");
+          setLastSyncAt(new Date());
+        },
+      )
+      .subscribe();
+
+    return () => {
+      void supabase.removeChannel(channel);
+    };
+  }, [ready, user]);
+
+  useEffect(() => {
+    if (!ready || !user || !syncInitialized) return;
+
+    const dirtyDays = Object.entries(modifiedAt)
+      .map(([day, timestamp]) => ({ day: Number(day), timestamp }))
+      .filter(({ day, timestamp }) => timestamp > (lastSyncedRef.current[day] ?? ""));
+    if (dirtyDays.length === 0) return;
+
+    if (!navigator.onLine) {
+      setSyncStatus("offline");
+      return;
+    }
+
+    setSyncStatus("syncing");
+    const timeout = window.setTimeout(async () => {
+      const snapshot = stateRef.current;
+      const rows = dirtyDays
+        .filter(({ day, timestamp }) => snapshot.modifiedAt[day] === timestamp)
+        .map(({ day, timestamp }) => ({
+          user_id: user.id,
+          day_number: day,
+          completed: snapshot.completed.has(day),
+          note: snapshot.notes[day] ?? "",
+          focus_minutes: snapshot.focusMinutes[day] ?? 0,
+          updated_at: timestamp,
+        }));
+      if (rows.length === 0) return;
+
+      const { error } = await supabase
+        .from("study_day_states")
+        .upsert(rows, { onConflict: "user_id,day_number" });
+      if (error) {
+        setSyncStatus(navigator.onLine ? "error" : "offline");
+        return;
+      }
+
+      for (const row of rows) lastSyncedRef.current[row.day_number] = row.updated_at;
+      setSyncStatus("synced");
+      setLastSyncAt(new Date());
+    }, 700);
+
+    return () => window.clearTimeout(timeout);
+  }, [completed, focusMinutes, modifiedAt, notes, ready, syncInitialized, user]);
 
   const nextDay = useMemo(
     () => studyDays.find((item) => !completed.has(item.day)) ?? studyDays.at(-1)!,
@@ -215,6 +527,7 @@ export default function Home() {
             ...minutes,
             [focusDay.day]: (minutes[focusDay.day] ?? 0) + 25,
           }));
+          markDayModified(focusDay.day);
           return 0;
         }
         return current - 1;
@@ -223,6 +536,17 @@ export default function Home() {
     return () => window.clearInterval(interval);
   }, [focusDay.day, timerRunning]);
 
+  function markDayModified(day: number) {
+    setModifiedAt((current) => ({ ...current, [day]: new Date().toISOString() }));
+  }
+
+  function markAllDaysModified() {
+    const timestamp = new Date().toISOString();
+    setModifiedAt(
+      Object.fromEntries(studyDays.map((item) => [item.day, timestamp])),
+    );
+  }
+
   function toggleDay(day: number) {
     setCompleted((current) => {
       const updated = new Set(current);
@@ -230,6 +554,7 @@ export default function Home() {
       else updated.add(day);
       return updated;
     });
+    markDayModified(day);
   }
 
   function changeView(view: ViewKey) {
@@ -246,6 +571,7 @@ export default function Home() {
 
   function updateNote(day: number, note: string) {
     setNotes((current) => ({ ...current, [day]: note.slice(0, 500) }));
+    markDayModified(day);
   }
 
   function resetTimer() {
@@ -291,6 +617,7 @@ export default function Home() {
       );
       setNotes(cleanNotes(parsed.notes));
       setFocusMinutes(cleanMinutes(parsed.focusMinutes));
+      markAllDaysModified();
       window.alert("学习记录已恢复。");
     } catch {
       window.alert("无法导入：请选择由本网页导出的 JSON 备份文件。");
@@ -298,15 +625,62 @@ export default function Home() {
   }
 
   function resetProgress() {
-    if (window.confirm("确定清除这台设备上的打卡、笔记和专注时长吗？")) {
+    const scope = user ? "所有已登录设备" : "这台设备";
+    if (window.confirm(`确定清除${scope}上的打卡、笔记和专注时长吗？`)) {
       setCompleted(new Set());
       setNotes({});
       setFocusMinutes({});
+      markAllDaysModified();
       resetTimer();
       setSelectedWeek(1);
       setActiveView("today");
     }
   }
+
+  async function sendMagicLink(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const email = authEmail.trim();
+    if (!email) return;
+
+    setAuthPending(true);
+    setAuthMessage("");
+    const redirectTo = `${window.location.origin}${window.location.pathname}`;
+    const { error } = await supabase.auth.signInWithOtp({
+      email,
+      options: { emailRedirectTo: redirectTo },
+    });
+    setAuthPending(false);
+    setAuthMessage(
+      error
+        ? `登录链接发送失败：${error.message}`
+        : "登录链接已发送。请在这台设备打开邮件中的链接。",
+    );
+  }
+
+  async function signOut() {
+    setAuthPending(true);
+    const { error } = await supabase.auth.signOut();
+    setAuthPending(false);
+    if (error) setAuthMessage(`退出失败：${error.message}`);
+    else setSyncPanelOpen(false);
+  }
+
+  const syncLabel = !user
+    ? "仅本机"
+    : syncStatus === "syncing"
+      ? "正在同步"
+      : syncStatus === "offline"
+        ? "离线保存"
+        : syncStatus === "error"
+          ? "同步异常"
+          : "云端已同步";
+  const syncDetail = !user
+    ? "登录后跨设备"
+    : syncStatus === "offline"
+      ? "联网后自动继续"
+      : syncStatus === "error"
+        ? "点击重试"
+        : formatSyncTime(lastSyncAt);
 
   return (
     <main className="app-shell">
@@ -336,11 +710,88 @@ export default function Home() {
           ))}
         </div>
 
-        <button className="header-progress" onClick={() => changeView("progress")}>
-          <span>{completed.size} / 84</span>
-          <i><b style={{ width: `${percentage}%` }} /></i>
-        </button>
+        <div className="header-actions">
+          <button
+            className={`sync-status-button status-${syncStatus}`}
+            onClick={() => setSyncPanelOpen(true)}
+            aria-label={`同步状态：${syncLabel}`}
+          >
+            <span className="sync-orbit" aria-hidden="true"><i /><i /></span>
+            <span><b>{syncLabel}</b><em>{syncDetail}</em></span>
+          </button>
+          <button className="header-progress" onClick={() => changeView("progress")}>
+            <span>{completed.size} / 84</span>
+            <i><b style={{ width: `${percentage}%` }} /></i>
+          </button>
+        </div>
       </header>
+
+      {syncPanelOpen && (
+        <div className="sync-modal-backdrop">
+          <section className="sync-modal" role="dialog" aria-modal="true" aria-labelledby="sync-modal-title">
+            <button
+              className="sync-modal-close"
+              onClick={() => setSyncPanelOpen(false)}
+              aria-label="关闭同步设置"
+            >
+              ×
+            </button>
+            <p className="overline">CLOUD SYNC</p>
+            <h2 id="sync-modal-title">让学习记录跟着你。</h2>
+            <p className="sync-modal-lead">
+              {user
+                ? "打卡、笔记和专注时长会自动同步；断网时照常记录，联网后继续。"
+                : "使用邮箱登录后，这台设备上的现有记录会与云端合并，不会被清空。"}
+            </p>
+
+            {user ? (
+              <>
+                <div className={`sync-account-card status-${syncStatus}`}>
+                  <span className="sync-account-mark" aria-hidden="true"><i /><i /></span>
+                  <div>
+                    <b>{syncLabel}</b>
+                    <span>{user.email ?? "已登录账号"}</span>
+                  </div>
+                  <em>{syncDetail}</em>
+                </div>
+                <ul className="sync-facts">
+                  <li><b>自动保存</b><span>修改后约 1 秒写入云端</span></li>
+                  <li><b>逐日合并</b><span>不同日期的记录不会互相覆盖</span></li>
+                  <li><b>仅你可见</b><span>数据库按登录账号隔离</span></li>
+                </ul>
+                {authMessage && <p className="sync-message" role="status">{authMessage}</p>}
+                <div className="sync-modal-actions">
+                  <button
+                    onClick={() => setSyncRetry((current) => current + 1)}
+                    disabled={syncStatus === "syncing"}
+                  >
+                    {syncStatus === "syncing" ? "正在同步" : "立即同步"}
+                  </button>
+                  <button className="quiet" onClick={signOut} disabled={authPending}>退出登录</button>
+                </div>
+              </>
+            ) : (
+              <form className="sync-login-form" onSubmit={sendMagicLink}>
+                <label htmlFor="sync-email">邮箱</label>
+                <input
+                  id="sync-email"
+                  type="email"
+                  value={authEmail}
+                  onChange={(event) => setAuthEmail(event.target.value)}
+                  placeholder="name@example.com"
+                  autoComplete="email"
+                  required
+                />
+                <button type="submit" disabled={authPending}>
+                  {authPending ? "正在发送" : "发送登录链接"}
+                </button>
+                <p>请使用你刚才登录 Supabase 的同一邮箱；无需设置密码，其他设备也使用这一个邮箱。</p>
+                {authMessage && <p className="sync-message" role="status">{authMessage}</p>}
+              </form>
+            )}
+          </section>
+        </div>
+      )}
 
       {activeView === "today" && (
         <section
@@ -700,7 +1151,10 @@ export default function Home() {
       )}
 
       <footer className="app-footer">
-        <span>进度仅保存在当前浏览器</span>
+        <button onClick={() => setSyncPanelOpen(true)}>
+          <span className={`footer-sync-dot status-${syncStatus}`} aria-hidden="true" />
+          {user ? `${syncLabel} · ${user.email ?? "已登录"}` : "当前仅保存在此设备 · 登录后跨设备同步"}
+        </button>
         <p>先完成，再优化。</p>
       </footer>
     </main>
