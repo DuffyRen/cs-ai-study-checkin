@@ -1,5 +1,7 @@
 "use client";
 
+/* eslint-disable react-hooks/set-state-in-effect -- localStorage is restored after hydration. */
+
 import { useEffect, useMemo, useState } from "react";
 import { studyDays } from "./studyData";
 

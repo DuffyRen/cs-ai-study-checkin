@@ -1,4 +1,18 @@
-# vinext-starter
+# CS / AI 12 周学习打卡
+
+在线访问：<https://duffyren.github.io/cs-ai-study-checkin/>
+
+从 2026 年 8 月 17 日开始的 84 天学习计划，覆盖 Python、数据结构与算法、Python 项目、机器学习、LLM 与 Agent。每一天都有课程链接、具体任务和完成勾选框，进度只保存在当前浏览器。
+
+## GitHub Pages 发布
+
+```bash
+npm run build:pages
+```
+
+静态网页生成在 `dist-pages/`。
+
+## 原始 Sites 开发环境
 
 A clean full-stack starter running on
 [vinext](https://github.com/cloudflare/vinext), with optional Cloudflare D1 and
