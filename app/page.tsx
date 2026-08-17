@@ -204,28 +204,24 @@ export default function Home() {
                 <h2>{focusDay.course}</h2>
                 <p>{focusDay.task}</p>
               </div>
-              <a className="course-button" href={focusDay.url} target="_blank" rel="noreferrer">
-                打开课程 <ArrowIcon />
-              </a>
-            </article>
-
-            <aside className={`check-card ${completed.has(focusDay.day) ? "is-done" : ""}`}>
-              <p>{completed.has(focusDay.day) ? "今天已完成" : "完成后在这里打勾"}</p>
-              <label className="large-check">
-                <input
-                  type="checkbox"
-                  checked={completed.has(focusDay.day)}
-                  onChange={() => toggleDay(focusDay.day)}
-                />
-                <span className="large-check-box" aria-hidden="true"><CheckIcon /></span>
-                <b>{completed.has(focusDay.day) ? "做得好，继续保持" : "标记为已完成"}</b>
-              </label>
-              <div className="week-meter">
-                <span>本周进度</span>
-                <strong>{focusWeekDone} / 7</strong>
-                <i><b style={{ width: `${(focusWeekDone / 7) * 100}%` }} /></i>
+              <div className="focus-card-actions">
+                <a className="course-button" href={focusDay.url} target="_blank" rel="noreferrer">
+                  打开课程 <ArrowIcon />
+                </a>
+                <label className={`completion-control ${completed.has(focusDay.day) ? "is-done" : ""}`}>
+                  <input
+                    type="checkbox"
+                    checked={completed.has(focusDay.day)}
+                    onChange={() => toggleDay(focusDay.day)}
+                  />
+                  <span className="compact-check-box" aria-hidden="true"><CheckIcon /></span>
+                  <span className="completion-copy">
+                    <b>{completed.has(focusDay.day) ? "今天已完成" : "完成今日任务"}</b>
+                    <em>本周进度 {focusWeekDone} / 7</em>
+                  </span>
+                </label>
               </div>
-            </aside>
+            </article>
           </div>
 
           <section className="this-week" aria-labelledby="this-week-title">
