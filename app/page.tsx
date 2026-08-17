@@ -2,10 +2,12 @@
 
 /* eslint-disable react-hooks/set-state-in-effect -- localStorage is restored after hydration. */
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type ChangeEvent } from "react";
 import { studyDays } from "./studyData";
 
 const STORAGE_KEY = "cs-ai-study-checkin-v1";
+const DETAILS_STORAGE_KEY = "cs-ai-study-details-v1";
+const FOCUS_SECONDS = 25 * 60;
 
 const phaseNotes: Record<string, string> = {
   "Python 基础": "先把代码写起来",
@@ -35,11 +37,41 @@ function phaseClass(phase: string) {
   return `phase-${phase.replaceAll(" ", "-")}`;
 }
 
+function cleanNotes(value: unknown): Record<number, string> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return Object.fromEntries(
+    Object.entries(value).filter(([day, note]) => {
+      const dayNumber = Number(day);
+      return dayNumber >= 1 && dayNumber <= studyDays.length && typeof note === "string";
+    }),
+  );
+}
+
+function cleanMinutes(value: unknown): Record<number, number> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return Object.fromEntries(
+    Object.entries(value).filter(([day, minutes]) => {
+      const dayNumber = Number(day);
+      return (
+        dayNumber >= 1 &&
+        dayNumber <= studyDays.length &&
+        typeof minutes === "number" &&
+        Number.isFinite(minutes) &&
+        minutes >= 0
+      );
+    }),
+  );
+}
+
 export default function Home() {
   const [completed, setCompleted] = useState<Set<number>>(new Set());
   const [ready, setReady] = useState(false);
   const [activeView, setActiveView] = useState<ViewKey>("today");
   const [selectedWeek, setSelectedWeek] = useState(1);
+  const [notes, setNotes] = useState<Record<number, string>>({});
+  const [focusMinutes, setFocusMinutes] = useState<Record<number, number>>({});
+  const [timerSeconds, setTimerSeconds] = useState(FOCUS_SECONDS);
+  const [timerRunning, setTimerRunning] = useState(false);
 
   useEffect(() => {
     try {
@@ -56,6 +88,15 @@ export default function Home() {
           setCompleted(savedDays);
           const next = studyDays.find((item) => !savedDays.has(item.day));
           if (next) setSelectedWeek(next.week);
+        }
+      }
+
+      const savedDetails = window.localStorage.getItem(DETAILS_STORAGE_KEY);
+      if (savedDetails) {
+        const parsedDetails = JSON.parse(savedDetails);
+        if (parsedDetails && typeof parsedDetails === "object") {
+          setNotes(cleanNotes(parsedDetails.notes));
+          setFocusMinutes(cleanMinutes(parsedDetails.focusMinutes));
         }
       }
     } catch {
@@ -77,6 +118,18 @@ export default function Home() {
     }
   }, [completed, ready]);
 
+  useEffect(() => {
+    if (!ready) return;
+    try {
+      window.localStorage.setItem(
+        DETAILS_STORAGE_KEY,
+        JSON.stringify({ notes, focusMinutes }),
+      );
+    } catch {
+      // Keep notes and timer usable in-session when storage is unavailable.
+    }
+  }, [focusMinutes, notes, ready]);
+
   const nextDay = useMemo(
     () => studyDays.find((item) => !completed.has(item.day)) ?? studyDays.at(-1)!,
     [completed],
@@ -86,6 +139,23 @@ export default function Home() {
   const scheduledToday = studyDays.find((item) => item.date === todayLabel);
   const focusDay = scheduledToday && !completed.has(scheduledToday.day) ? scheduledToday : nextDay;
   const percentage = Math.round((completed.size / studyDays.length) * 100);
+  const completedSequence = useMemo(() => {
+    let count = 0;
+    for (const item of studyDays) {
+      if (!completed.has(item.day)) break;
+      count += 1;
+    }
+    return count;
+  }, [completed]);
+  const totalFocusMinutes = useMemo(
+    () => Object.values(focusMinutes).reduce((sum, minutes) => sum + minutes, 0),
+    [focusMinutes],
+  );
+  const hasLocalData =
+    completed.size > 0 ||
+    totalFocusMinutes > 0 ||
+    Object.values(notes).some((note) => note.trim().length > 0);
+  const timerLabel = `${String(Math.floor(timerSeconds / 60)).padStart(2, "0")}:${String(timerSeconds % 60).padStart(2, "0")}`;
 
   const weeks = useMemo(
     () =>
@@ -113,6 +183,30 @@ export default function Home() {
     [completed],
   );
 
+  useEffect(() => {
+    setTimerRunning(false);
+    setTimerSeconds(FOCUS_SECONDS);
+  }, [focusDay.day]);
+
+  useEffect(() => {
+    if (!timerRunning) return;
+    const interval = window.setInterval(() => {
+      setTimerSeconds((current) => {
+        if (current <= 1) {
+          window.clearInterval(interval);
+          setTimerRunning(false);
+          setFocusMinutes((minutes) => ({
+            ...minutes,
+            [focusDay.day]: (minutes[focusDay.day] ?? 0) + 25,
+          }));
+          return 0;
+        }
+        return current - 1;
+      });
+    }, 1000);
+    return () => window.clearInterval(interval);
+  }, [focusDay.day, timerRunning]);
+
   function toggleDay(day: number) {
     setCompleted((current) => {
       const updated = new Set(current);
@@ -134,9 +228,65 @@ export default function Home() {
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
+  function updateNote(day: number, note: string) {
+    setNotes((current) => ({ ...current, [day]: note.slice(0, 500) }));
+  }
+
+  function resetTimer() {
+    setTimerRunning(false);
+    setTimerSeconds(FOCUS_SECONDS);
+  }
+
+  function exportBackup() {
+    const payload = {
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      completed: Array.from(completed).sort((a, b) => a - b),
+      notes,
+      focusMinutes,
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `cs-ai-study-backup-${new Date().toISOString().slice(0, 10)}.json`;
+    link.click();
+    URL.revokeObjectURL(url);
+  }
+
+  async function importBackup(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    if (!window.confirm("导入会替换当前浏览器里的打卡、笔记和专注时长，继续吗？")) return;
+
+    try {
+      const parsed = JSON.parse(await file.text());
+      if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.completed)) {
+        throw new Error("invalid backup");
+      }
+      setCompleted(
+        new Set(
+          parsed.completed.filter(
+            (day: unknown): day is number =>
+              Number.isInteger(day) && Number(day) >= 1 && Number(day) <= studyDays.length,
+          ),
+        ),
+      );
+      setNotes(cleanNotes(parsed.notes));
+      setFocusMinutes(cleanMinutes(parsed.focusMinutes));
+      window.alert("学习记录已恢复。");
+    } catch {
+      window.alert("无法导入：请选择由本网页导出的 JSON 备份文件。");
+    }
+  }
+
   function resetProgress() {
-    if (window.confirm("确定清除这台设备上的全部打卡记录吗？")) {
+    if (window.confirm("确定清除这台设备上的打卡、笔记和专注时长吗？")) {
       setCompleted(new Set());
+      setNotes({});
+      setFocusMinutes({});
+      resetTimer();
       setSelectedWeek(1);
       setActiveView("today");
     }
@@ -224,6 +374,46 @@ export default function Home() {
             </article>
           </div>
 
+          <section className="study-tools" aria-label="今日学习工具">
+            <article className="timer-tool">
+              <div>
+                <p className="overline">FOCUS TIMER</p>
+                <h2>专注 25 分钟</h2>
+                <span>本日累计 {focusMinutes[focusDay.day] ?? 0} 分钟</span>
+              </div>
+              <strong aria-live="polite">{timerLabel}</strong>
+              <div className="timer-actions">
+                <button
+                  onClick={() => {
+                    if (timerSeconds === 0) {
+                      setTimerSeconds(FOCUS_SECONDS);
+                      setTimerRunning(true);
+                    } else {
+                      setTimerRunning((running) => !running);
+                    }
+                  }}
+                >
+                  {timerRunning ? "暂停" : timerSeconds === 0 ? "再来一次" : "开始"}
+                </button>
+                <button className="quiet" onClick={resetTimer}>重置</button>
+              </div>
+            </article>
+
+            <div className="note-tool">
+              <label htmlFor={`today-note-${focusDay.day}`}>
+                <b>今天记住了什么？</b>
+                <em>{(notes[focusDay.day] ?? "").length}/500</em>
+              </label>
+              <textarea
+                id={`today-note-${focusDay.day}`}
+                value={notes[focusDay.day] ?? ""}
+                onChange={(event) => updateNote(focusDay.day, event.target.value)}
+                placeholder="记一句关键理解、一个问题，或下一步要验证的想法……"
+                maxLength={500}
+              />
+            </div>
+          </section>
+
           <section className="this-week" aria-labelledby="this-week-title">
             <div className="subsection-heading">
               <div>
@@ -269,7 +459,7 @@ export default function Home() {
               <p className="overline">12-WEEK PLAN</p>
               <h1>一次只看一周。</h1>
             </div>
-            {completed.size > 0 && (
+            {hasLocalData && (
               <button className="reset-button" onClick={resetProgress}>清除全部进度</button>
             )}
           </div>
@@ -318,6 +508,19 @@ export default function Home() {
                       {item.course} <ArrowIcon />
                     </a>
                     <p>{item.task}</p>
+                    <div className="day-record-meta">
+                      {(focusMinutes[item.day] ?? 0) > 0 && <span>专注 {focusMinutes[item.day]} 分钟</span>}
+                      {notes[item.day] && <span>已有学习笔记</span>}
+                    </div>
+                    <details className="day-note">
+                      <summary>{notes[item.day] ? "编辑笔记" : "添加笔记"}</summary>
+                      <textarea
+                        value={notes[item.day] ?? ""}
+                        onChange={(event) => updateNote(item.day, event.target.value)}
+                        placeholder="记录这一天的关键理解或疑问……"
+                        maxLength={500}
+                      />
+                    </details>
                   </div>
                   <label className="row-check">
                     <input
@@ -348,7 +551,16 @@ export default function Home() {
               <p className="overline">84-DAY MAP</p>
               <h1>你的学习轨迹。</h1>
             </div>
-            <p>点击任意一天，直接查看对应任务。</p>
+            <div className="progress-intro-actions">
+              <p>点击任意一天，直接查看对应任务。</p>
+              <div>
+                <button onClick={exportBackup}>导出备份</button>
+                <label>
+                  导入备份
+                  <input type="file" accept="application/json,.json" onChange={importBackup} />
+                </label>
+              </div>
+            </div>
           </div>
 
           <div className="progress-dashboard">
@@ -356,6 +568,10 @@ export default function Home() {
               <span>总进度</span>
               <strong>{percentage}<i>%</i></strong>
               <p>{completed.size} 天完成 · 还有 {studyDays.length - completed.size} 天</p>
+              <ul>
+                <li><b>{completedSequence}</b><span>连续完成</span></li>
+                <li><b>{totalFocusMinutes}</b><span>专注分钟</span></li>
+              </ul>
               <div><b style={{ width: `${percentage}%` }} /></div>
             </div>
 

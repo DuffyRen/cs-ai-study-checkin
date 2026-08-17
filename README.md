@@ -12,6 +12,15 @@ npm run build:pages
 
 静态网页生成在 `dist-pages/`。
 
+## 产品参考
+
+- [Iotawise](https://github.com/redpangilinan/iotawise)（MIT）：参考低负担打卡、连续完成与进度反馈。
+- [Super Productivity](https://github.com/super-productivity/super-productivity)（MIT）：参考专注计时和本地数据管理。
+- [DevTrail](https://github.com/hereisSwapnil/DevTrail)（MIT）：参考逐项学习笔记与 JSON 导入导出。
+- [roadmap.sh](https://github.com/nilbuild/developer-roadmap)（自定义许可）：只参考结构化学习路径的产品思路，未复制代码。
+
+本项目针对固定的 84 天 CS / AI 学习计划独立实现，没有复制上述项目的界面或代码。
+
 ## 原始 Sites 开发环境
 
 A clean full-stack starter running on
